@@ -42,9 +42,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>글로벌 물류 지구본</title>
 
-<script src="https://unpkg.com/maplibre-gl@5.8.0/dist/maplibre-gl.js"></script>
+<script src="lib/maplibre-gl.js"></script>
 <script src="flow-layer.js"></script>
-<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.8.0/dist/maplibre-gl.css"/>
+<link rel="stylesheet" href="lib/maplibre-gl.css"/>
 
 <style>
   html, body, #map { height: 100%; margin: 0; padding: 0; background:#0b1220; }
@@ -442,7 +442,7 @@ var INITIAL_ZOOM = 2.4;
 
 var SAT_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
 var VECTOR_STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
-var EMPIRE_CDN_BASE = "https://cdn.jsdelivr.net/gh/aourednik/historical-basemaps@master/geojson/";
+var EMPIRE_CDN_BASE = "data/empires/"; // 오프라인 지원을 위해 로컬에 미리 받아 내장 (원본: aourednik/historical-basemaps)
 
 // 지도 모드의 지면 기본색(벡터 스타일 원본 배경색과 동일 - 건물/구획 사이 빈틈에 비치는 색)
 // vs 위성/지구본 모드의 우주 배경색. 하나의 배경색만 쓰면 고배율 지도 모드에서
@@ -1581,7 +1581,7 @@ function buildLandGrid(geojson) {
 }
 
 function loadLandMask() {
-  fetch("https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector/geojson/ne_110m_land.geojson")
+  fetch("data/ne_110m_land.geojson") // 오프라인 지원을 위해 로컬에 미리 받아 내장 (원본: nvkelso/natural-earth-vector)
     .then(function (r) { return r.json(); })
     .then(function (geojson) {
       LAND_GRID = buildLandGrid(geojson);
@@ -2131,7 +2131,8 @@ fetch(VECTOR_STYLE_URL)
       "storms-src": { type: "geojson", data: stormsToFC(STORMS_SNAPSHOT) },
       "storm-spirals-src": { type: "geojson", lineMetrics: true, data: buildStormSpiralsFC(STORMS_SNAPSHOT) },
       "flight-route-src": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
-      "carrier-route-src": { type: "geojson", data: { type: "FeatureCollection", features: [] } }
+      "carrier-route-src": { type: "geojson", data: { type: "FeatureCollection", features: [] } },
+      "carrier-route-ports-src": { type: "geojson", data: { type: "FeatureCollection", features: [] } }
     };
     Object.keys(vectorStyle.sources).forEach(function (key) { sources[key] = vectorStyle.sources[key]; });
 
@@ -2256,6 +2257,25 @@ fetch(VECTOR_STYLE_URL)
         "text-field": ["get", "code"], "text-size": 12, "text-font": ["Noto Sans Bold"]
       },
       paint: { "text-color": "#ffffff", "text-halo-color": "#0b3d1e", "text-halo-width": 1.6 }
+    });
+
+    // 선사 항로의 개별 콜링 포트(기항지) 점 표시 + 옆에 작게 5자리 코드(있는 경우)
+    layers.push({
+      id: "carrier-route-ports-circle", type: "circle", source: "carrier-route-ports-src",
+      layout: { visibility: "none" },
+      paint: {
+        "circle-radius": 4, "circle-color": "#39ff6e",
+        "circle-stroke-color": "#0b3d1e", "circle-stroke-width": 1.5
+      }
+    });
+    layers.push({
+      id: "carrier-route-ports-label", type: "symbol", source: "carrier-route-ports-src",
+      layout: {
+        visibility: "none", "text-field": ["get", "label"], "text-size": 10,
+        "text-font": ["Noto Sans Bold"], "text-offset": [0, 0.9], "text-anchor": "top",
+        "text-optional": true
+      },
+      paint: { "text-color": "#baffd0", "text-halo-color": "#0b3d1e", "text-halo-width": 1.4 }
     });
 
     initMap({ version: 8, glyphs: vectorStyle.glyphs, sprite: vectorStyle.sprite, sources: sources, layers: layers });
@@ -2968,9 +2988,12 @@ function clearCarrierRoute() {
   if (carrierRouteActive && carrierRouteActive.marker) carrierRouteActive.marker.remove();
   carrierRouteActive = null;
   if (map.getSource("carrier-route-src")) map.getSource("carrier-route-src").setData({ type: "FeatureCollection", features: [] });
+  if (map.getSource("carrier-route-ports-src")) map.getSource("carrier-route-ports-src").setData({ type: "FeatureCollection", features: [] });
   if (map.getLayer("carrier-route-line")) map.setLayoutProperty("carrier-route-line", "visibility", "none");
   if (map.getLayer("carrier-route-glow")) map.setLayoutProperty("carrier-route-glow", "visibility", "none");
   if (map.getLayer("carrier-route-label")) map.setLayoutProperty("carrier-route-label", "visibility", "none");
+  if (map.getLayer("carrier-route-ports-circle")) map.setLayoutProperty("carrier-route-ports-circle", "visibility", "none");
+  if (map.getLayer("carrier-route-ports-label")) map.setLayoutProperty("carrier-route-ports-label", "visibility", "none");
   if (carrierRoutePopup) { carrierRoutePopup.remove(); carrierRoutePopup = null; }
 }
 
@@ -3001,6 +3024,23 @@ function showCarrierRoute(item) {
   map.setLayoutProperty("carrier-route-line", "visibility", "visible");
   map.setLayoutProperty("carrier-route-glow", "visibility", "visible");
   map.setLayoutProperty("carrier-route-label", "visibility", "visible");
+
+  // 콜링 포트(기항지)마다 점 + 5자리 코드 라벨 - 같은 항만을 두 번 지나도 한 번만 표시
+  var seenPorts = {};
+  var portFeatures = [];
+  item.waypoints.forEach(function (w) {
+    var canon = canonicalPortName(w.name);
+    if (seenPorts[canon]) return;
+    seenPorts[canon] = true;
+    var code = PORT_UNLOCODE_INDEX[canon.toLowerCase()] || "";
+    portFeatures.push({
+      type: "Feature", properties: { name: canon, code: code, label: code },
+      geometry: { type: "Point", coordinates: [w.lon, w.lat] }
+    });
+  });
+  map.getSource("carrier-route-ports-src").setData({ type: "FeatureCollection", features: portFeatures });
+  map.setLayoutProperty("carrier-route-ports-circle", "visibility", "visible");
+  map.setLayoutProperty("carrier-route-ports-label", "visibility", "visible");
 
   var mid = item.waypoints[Math.floor(item.waypoints.length / 2)];
   carrierRoutePopup = new maplibregl.Popup({ closeButton: true, closeOnClick: false, maxWidth: "270px", offset: 10 })
